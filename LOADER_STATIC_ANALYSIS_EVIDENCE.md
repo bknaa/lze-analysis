@@ -250,6 +250,94 @@ mapping, not a hook-based method. It relies on the target process loading `laze.
 normal Windows loader, which means the payload DLL's own `DllMain`/exports run exactly as they
 would for a legitimately loaded module.
 
+## 11. CIL Bytecode-Level Verification (manual metadata/IL parsing)
+
+Sections 1–10 identify method names and API targets from .NET metadata, but do not confirm the
+actual constant values passed to the injection APIs. To verify this, the CLR header, metadata
+stream headers, and `MethodDef` table were parsed by hand (via a small Python script reading raw
+PE structures — no decompiler was used), locating the RVA and IL body of each method of interest
+and manually disassembling the CIL opcodes.
+
+### 11.1 Method table (from parsed `MethodDef`, `#~` stream)
+
+```
+Main                          RVA=0x2048
+start                         RVA=0x2094
+inject                        RVA=0x224c
+find_target_process           RVA=0x2350
+get_kernel32_base_address     RVA=0x23c0
+get_dll_path                  RVA=0x2448
+should_update                 RVA=0x2480
+update_dll                    RVA=0x24fc
+allocate_and_write_memory     RVA=0x25a8
+create_remote_thread          RVA=0x2628
+compute_sha1                  RVA=0x267c
+log                           RVA=0x26d0
+
+VirtualAllocEx / WriteProcessMemory / CreateRemoteThread / GetProcAddress
+    RVA=0x0, ImplFlags=0x80 (PreserveSig), Flags=0x2096 (PinvokeImpl | Static | HideBySig)
+    — confirmed P/Invoke declarations, no managed body (as expected).
+```
+
+### 11.2 `allocate_and_write_memory` — raw CIL disassembly (relevant excerpt)
+
+```
+ldarg.2
+ldarg.0
+ldsfld    token=0x0a00001a        ; static field ref (consistent with System.IntPtr.Zero)
+ldarg.1
+callvirt  token=0x0a000037
+ldc.i4    12288                   ; 0x3000 = MEM_COMMIT (0x1000) | MEM_RESERVE (0x2000)
+ldc.i4.4                          ; 4 = PAGE_READWRITE
+call      token=0x0600000f        ; VirtualAllocEx(hProcess, lpAddress, dwSize, 0x3000, 4)
+```
+
+**Finding:** memory is allocated in the target process with `PAGE_READWRITE` protection — **not**
+`PAGE_EXECUTE_READWRITE`. This confirms the allocated region is used to hold data (the DLL path
+string for `WriteProcessMemory`), not executable shellcode. The actual code execution is delegated
+entirely to the legitimate Windows loader via `LoadLibraryA`, executed through the remote thread
+described below — this injector does not write or run shellcode of its own.
+
+### 11.3 `create_remote_thread` — raw CIL disassembly (relevant excerpt)
+
+```
+ldarg.0
+ldsfld   token=0x0a00001a
+ldc.i4.0
+ldarg.1
+ldstr    token=0x70000541
+call     token=0x06000012
+ldarg.2
+ldc.i4.0                          ; dwCreationFlags = 0
+ldsfld   token=0x0a00001a
+call     token=0x06000011         ; CreateRemoteThread(hProcess, NULL, 0, lpStartAddress, lpParameter, 0, out lpThreadId)
+```
+
+**Finding:** `dwCreationFlags = 0` — the `CREATE_SUSPENDED` flag (`0x4`) is never used anywhere in
+this method. The remote thread begins executing immediately upon creation; there is no
+suspend/resume step, no thread context manipulation, and no attempt to hide the thread's start
+address.
+
+### 11.4 Consolidated memory-integrity summary
+
+The complete set of operations this loader performs against the target (CraftRise) process's
+memory, in order, with confirmed parameters:
+
+```
+1. OpenProcess           (implicit, via ProcessModule handle from find_target_process)
+2. VirtualAllocEx        (hProcess, NULL, size, MEM_COMMIT|MEM_RESERVE (0x3000), PAGE_READWRITE (4))
+3. WriteProcessMemory     (hProcess, allocatedAddr, <UTF path string of laze.dll>, size)
+4. GetProcAddress         (kernel32 module handle, "LoadLibraryA")   — resolved locally, not remotely
+5. CreateRemoteThread     (hProcess, NULL, 0, <LoadLibraryA address>, allocatedAddr, 0 /*not suspended*/, &threadId)
+```
+
+No shellcode is written. No executable memory is allocated. No thread hijacking, no
+`SetThreadContext`/APC queuing, no manual PE mapping is used anywhere in this loader — this is the
+textbook/minimal form of `LoadLibrary`-based remote injection, distinguishable at the API-parameter
+level (RW-only allocation, immediate non-suspended thread start) from more evasive variants (e.g.
+the companion `TealipInjector` analyzed separately, which avoids `CreateRemoteThread` entirely via
+`SetWindowsHookExW`).
+
 ---
 
 ## Honest scope of this evidence
@@ -262,3 +350,9 @@ would for a legitimately loaded module.
   or a debugger trace — a full IL decompilation (e.g., via ILSpy/dnSpy) would be needed to confirm
   exact call ordering and argument values with certainty.
 - All hashes, strings, and header fields above are copied verbatim from tool output.
+- The CIL disassembly in §11 was produced by a hand-written PE/metadata parser (custom Python, not
+  a decompiler), and only decodes the common single-byte opcode set — not every `MemberRef`/`Field`
+  token was cross-resolved to its fully-qualified name (e.g. token `0x0a00001a` is inferred to be
+  `System.IntPtr.Zero` from usage pattern, not confirmed via full `TypeRef`/`MemberRef` chain
+  resolution). The two constant values central to the memory-integrity finding (`12288` /
+  `0x3000` and `4`) were read directly as raw IL immediate operands and are exact, not inferred.
